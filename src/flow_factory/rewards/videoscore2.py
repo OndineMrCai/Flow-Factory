@@ -1,0 +1,299 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# src/flow_factory/rewards/videoscore2.py
+"""
+VideoScore2 reward model (TIGER-Lab/VideoScore2).
+
+Scores generated videos along three dimensions (1-5 integer scale):
+  - Visual quality
+  - Text-to-video alignment
+  - Physical / common-sense consistency
+
+Each dimension is converted to a soft score via log-softmax over the five
+score tokens, then all three are combined into a single scalar in [0, 1].
+"""
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+from string import Template
+from typing import List, Optional
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from PIL import Image
+from transformers import AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
+
+from .abc import PointwiseRewardModel, RewardModelOutput
+from ..hparams import RewardArguments
+from ..utils.logger_utils import setup_logger
+
+logger = setup_logger(__name__)
+
+_VS2_QUERY_TEMPLATE = Template(
+    "You are an expert for evaluating AI-generated videos from three dimensions:\n"
+    "(1) visual quality – clarity, smoothness, artifacts;\n"
+    "(2) text-to-video alignment – fidelity to the prompt;\n"
+    "(3) physical/common-sense consistency – naturalness and physics plausibility.\n\n"
+    "Video prompt: $t2v_prompt\n\n"
+    "Please output in this format:\n"
+    "visual quality: <v_score>; \n"
+    "text-to-video alignment: <t_score>, \n"
+    "physical/common-sense consistency: <p_score>\n"
+)
+
+
+class VideoScore2RewardModel(PointwiseRewardModel):
+    """
+    Pointwise reward model backed by TIGER-Lab/VideoScore2.
+
+    Accepted extra_kwargs (all optional):
+        model_name_or_path  (str)   HF model id or local path. Default: "TIGER-Lab/VideoScore2"
+        visual_weight       (float) Weight for visual quality score.    Default: 1.0
+        text_align_weight   (float) Weight for text-alignment score.    Default: 1.0
+        physical_weight     (float) Weight for physical consistency.    Default: 1.0
+        infer_fps           (float) FPS used when feeding video to VS2. Default: 2.0
+        store_fps           (float) FPS used when writing temp video.   Default: 8.0
+    """
+
+    required_fields = ("prompt", "video")
+
+    def __init__(self, config: RewardArguments, accelerator: Accelerator):
+        super().__init__(config, accelerator)
+
+        model_name = config.extra_kwargs.get("model_name_or_path", "TIGER-Lab/VideoScore2")
+        logger.info(f"[VideoScore2] Loading model from: {model_name}")
+
+        self.vs2_model = (
+            AutoModelForVision2Seq.from_pretrained(
+                model_name,
+                torch_dtype=self.dtype,
+                trust_remote_code=True,
+            )
+            .eval()
+            .to(self.device)
+        )
+        self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self.tokenizer = getattr(self.processor, "tokenizer", None) or AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True, use_fast=False
+        )
+
+        self.w_visual = float(config.extra_kwargs.get("visual_weight", 1.0))
+        self.w_text = float(config.extra_kwargs.get("text_align_weight", 1.0))
+        self.w_physical = float(config.extra_kwargs.get("physical_weight", 1.0))
+        self.infer_fps = float(config.extra_kwargs.get("infer_fps", 2.0))
+        self.store_fps = float(config.extra_kwargs.get("store_fps", 8.0))
+
+    # ------------------------------------------------------------------
+    # Helpers (adapted from user-provided VideoScore2 inference code)
+    # ------------------------------------------------------------------
+
+    def _frames_to_tmp_video(self, frames: List[Image.Image]) -> str:
+        """Write PIL frames to a temporary .mp4 file and return its path."""
+        import cv2  # lazy import
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        w, h = frames[0].size
+        # Try codecs in order; mp4v may be unavailable in minimal environments
+        for fourcc_tag in ("mp4v", "avc1", "XVID", "MJPG"):
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_tag)
+            if fourcc != -1:
+                break
+        if fourcc == -1:
+            raise RuntimeError(
+                "No suitable cv2 video codec found. "
+                "Install opencv-python with ffmpeg support or install ffmpeg system package."
+            )
+        writer = cv2.VideoWriter(tmp_path, fourcc, self.store_fps, (w, h))
+        if not writer.isOpened():
+            raise RuntimeError(
+                f"cv2.VideoWriter failed to open with codec '{fourcc_tag}' "
+                f"for size ({w}, {h}) at {self.store_fps} fps. "
+                "Try installing system ffmpeg: apt-get install ffmpeg"
+            )
+        for frame in frames:
+            arr = np.array(frame.convert("RGB"))
+            writer.write(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+        writer.release()
+        return tmp_path
+
+    def _soft_score(self, logits: torch.Tensor, hard_val: Optional[int]) -> Optional[float]:
+        """
+        Compute a soft score for a single dimension using log-softmax over
+        score tokens "1"–"5", normalised by the sum of their probabilities.
+
+        Returns None when hard_val is None or the token index is invalid.
+        """
+        if hard_val is None:
+            return None
+
+        score_range = list(range(1, 6))
+        score_probs: list[tuple[int, float]] = []
+        for s in score_range:
+            ids = self.tokenizer.encode(str(s), add_special_tokens=False)
+            if len(ids) == 1:
+                logp = torch.log_softmax(logits, dim=-1)[ids[0]].item()
+                score_probs.append((s, float(np.exp(logp))))
+
+        if not score_probs:
+            logger.warning("[VideoScore2] No valid score token found in vocabulary.")
+            return None
+
+        scores_list, probs_list = zip(*score_probs)
+        total_prob = sum(probs_list)
+        max_prob = max(probs_list)
+        best_score = scores_list[probs_list.index(max_prob)]
+        normalized_prob = max_prob / total_prob if total_prob > 0 else 0.0
+        return round(best_score * normalized_prob, 4)
+
+    def _find_score_token_idx(self, prompt_text: str, gen_ids: List[int]) -> int:
+        """Return the index in gen_ids of the digit token that follows prompt_text."""
+        gen_str = self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+        pattern = r"(?:\(\d+\)\s*|\n\s*)?" + re.escape(prompt_text)
+        match = re.search(pattern, gen_str, flags=re.IGNORECASE)
+        if not match:
+            return -1
+        after_text = gen_str[match.end():]
+        num_match = re.search(r"\d", after_text)
+        if not num_match:
+            return -1
+        target_substr = gen_str[: match.end() + num_match.start() + 1]
+        for i in range(len(gen_ids)):
+            partial = self.tokenizer.decode(gen_ids[: i + 1], skip_special_tokens=False)
+            if partial == target_substr:
+                return i
+        return -1
+
+    # ------------------------------------------------------------------
+    # Core inference
+    # ------------------------------------------------------------------
+
+    def _score_single(self, prompt: str, frames: List[Image.Image]) -> float:
+        """Score one video clip and return a combined scalar in [0, 1]."""
+        from qwen_vl_utils import process_vision_info  # lazy import
+
+        tmp_path = self._frames_to_tmp_video(frames)
+        try:
+            user_prompt = _VS2_QUERY_TEMPLATE.substitute(t2v_prompt=prompt)
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": tmp_path, "fps": self.infer_fps},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                }
+            ]
+
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                fps=self.infer_fps,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            gen_out = self.vs2_model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                output_scores=True,
+                return_dict_in_generate=True,
+                do_sample=False,  # greedy for reproducibility during RL training
+            )
+
+            input_len = inputs["input_ids"].shape[1]
+            gen_ids = gen_out.sequences[0, input_len:].tolist()
+            output_text = self.processor.batch_decode(
+                gen_out.sequences[:, input_len:],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+
+            # Parse hard integer scores
+            pat = (
+                r"visual quality:\s*(\d+)"
+                r".*?text-to-video alignment:\s*(\d+)"
+                r".*?physical/common-sense consistency:\s*(\d+)"
+            )
+            m = re.search(pat, output_text, re.DOTALL | re.IGNORECASE)
+            v_hard = int(m.group(1)) if m else None
+            t_hard = int(m.group(2)) if m else None
+            p_hard = int(m.group(3)) if m else None
+
+            if m is None:
+                logger.warning(
+                    f"[VideoScore2] Failed to parse scores from output:\n{output_text}"
+                )
+
+            # Locate token positions for soft scoring
+            scores_tuple = gen_out.scores  # tuple of (vocab,) tensors
+            idx_v = self._find_score_token_idx("visual quality:", gen_ids)
+            idx_t = self._find_score_token_idx("text-to-video alignment:", gen_ids)
+            idx_p = self._find_score_token_idx("physical/common-sense consistency:", gen_ids)
+
+            v_soft = self._soft_score(scores_tuple[idx_v][0], v_hard) if idx_v >= 0 else None
+            t_soft = self._soft_score(scores_tuple[idx_t][0], t_hard) if idx_t >= 0 else None
+            p_soft = self._soft_score(scores_tuple[idx_p][0], p_hard) if idx_p >= 0 else None
+
+            # Fall back to hard score (normalised) if soft score unavailable
+            v_val = v_soft if v_soft is not None else (v_hard / 5.0 if v_hard else 0.0)
+            t_val = t_soft if t_soft is not None else (t_hard / 5.0 if t_hard else 0.0)
+            p_val = p_soft if p_soft is not None else (p_hard / 5.0 if p_hard else 0.0)
+
+            # Weighted average; each dimension's soft score is already ~[1,5] × prob
+            # Normalise to [0, 1] by dividing by 5
+            total_w = self.w_visual + self.w_text + self.w_physical
+            combined = (
+                self.w_visual * v_val
+                + self.w_text * t_val
+                + self.w_physical * p_val
+            ) / (total_w * 5.0)
+
+            return float(combined)
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: List[str],
+        image: Optional[List[Image.Image]] = None,
+        video: Optional[List[List[Image.Image]]] = None,
+        condition_images=None,
+        condition_videos=None,
+        **kwargs,
+    ) -> RewardModelOutput:
+        if video is None:
+            raise ValueError("VideoScore2RewardModel requires `video` input (list of frame lists).")
+
+        rewards = [self._score_single(p, frames) for p, frames in zip(prompt, video)]
+        return RewardModelOutput(
+            rewards=torch.tensor(rewards, dtype=torch.float32, device=self.device),
+        )

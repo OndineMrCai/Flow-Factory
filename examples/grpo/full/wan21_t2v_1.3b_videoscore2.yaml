@@ -1,0 +1,125 @@
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp_grad_op_shard.yaml
+num_processes: 8  # 8x H20 96GB, plenty of VRAM for 1.3B training model + VideoScore2 (~7B) per rank
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/videoscore2"  # Replace with your T2V prompt dataset
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 8
+  force_reprocess: true
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 3000
+
+# Model Configuration
+model:
+  finetune_type: 'full'
+  target_components: 'transformer'
+  target_modules: "default"
+  model_name_or_path: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+  model_type: "wan2_t2v"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'grpo'
+  advantage_aggregation: 'sum'  # Single reward → 'sum' and 'gdpo' are equivalent
+
+  # Clipping
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+
+  # KL div
+  kl_type: 'v-based'
+  kl_beta: 0  # Disabled for memory efficiency; enable (~1e-3) if training becomes unstable
+  ref_param_device: 'cuda'
+
+  # Sampling settings
+  # Start with conservative settings matching the reference 14B config to confirm the model runs
+  resolution: 256
+  num_frames: 5
+  num_inference_steps: 10
+  guidance_scale: 5.0
+
+  # Batch and sampling
+  per_device_batch_size: 1
+  group_size: 8                       # Reduced from 16 to keep GPU memory in check
+  global_std: false
+  unique_sample_num_per_epoch: 32     # 32 unique prompts × 8 repetitions = 256 videos/epoch
+  gradient_step_per_epoch: 2
+
+  # Optimization
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # EMA
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: true
+
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.9
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+  flow_shift: 3.0  # 3.0 for 480p (5.0 for 720p)
+
+# Evaluation settings
+eval:
+  resolution: 480
+  num_frames: 17
+  per_device_batch_size: 1
+  guidance_scale: 5.0
+  num_inference_steps: 28
+  eval_freq: 0  # disabled temporarily to isolate SIGFPE crash
+  seed: 42
+
+# Reward Model Configuration
+# VideoScore2 is a ~7B Qwen2-VL model – process one video at a time (batch_size: 1).
+# It runs on the same CUDA device as the training model. If you hit OOM, consider
+# using the Remote Reward Server approach (see guidance/rewards.md).
+rewards:
+  - name: "videoscore2"
+    reward_model: "flow_factory.rewards.videoscore2.VideoScore2RewardModel"
+    weight: 1.0
+    batch_size: 1        # VLM; one video at a time
+    device: "cuda"
+    dtype: bfloat16
+    # extra_kwargs passed to VideoScore2RewardModel.__init__
+    model_name_or_path: "TIGER-Lab/VideoScore2"
+    visual_weight: 1.0        # Weight for visual quality dimension
+    text_align_weight: 1.0    # Weight for text-to-video alignment dimension
+    physical_weight: 1.0      # Weight for physical/common-sense consistency dimension
+    infer_fps: 2.0            # FPS used when feeding video frames to VideoScore2
+    store_fps: 8.0            # FPS used when writing the temp video file
+
+# Optional: use a separate (possibly cheaper) reward at eval time
+# eval_rewards:
+#   - name: "clip_eval"
+#     reward_model: "CLIP"
+#     batch_size: 16
+#     device: "cuda"
+#     dtype: bfloat16

@@ -30,6 +30,7 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'pickscore_rank': 'flow_factory.rewards.pick_score.PickScoreRankRewardModel',
     'clip': 'flow_factory.rewards.clip.CLIPRewardModel',
     'ocr': 'flow_factory.rewards.ocr.OCRRewardModel',
+    'videoscore2': 'flow_factory.rewards.videoscore2.VideoScore2RewardModel',
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 
