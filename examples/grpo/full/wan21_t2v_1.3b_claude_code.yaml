@@ -10,7 +10,7 @@ data:
   dataset_dir: "dataset/videoscore2"  # Replace with your T2V prompt dataset
   preprocessing_batch_size: 8
   dataloader_num_workers: 8
-  force_reprocess: true
+  force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
   max_dataset_size: 3000
 
@@ -110,7 +110,7 @@ eval:
 # RemotePointwiseRewardModel does not forward extra kwargs to the server.
 rewards:
   - name: "claude_code_video_eval"
-    reward_model: "flow_factory.rewards.remote.RemotePointwiseRewardModel"
+    reward_model: "flow_factory.rewards.my_reward_remote.RemotePointwiseRewardModel"
     server_url: "http://localhost:8000"
     weight: 1.0
     batch_size: 1            # server parallelizes internally via ThreadPoolExecutor
