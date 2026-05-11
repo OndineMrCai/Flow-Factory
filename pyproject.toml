@@ -51,6 +51,10 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.31.0",
     "tqdm",
+
+    # Video reward models (VideoScore2: cv2.VideoWriter for temp mp4 + qwen-vl-utils for VLM frame sampling)
+    "opencv-python-headless>=4.8.0",
+    "qwen-vl-utils>=0.0.10",
 ]
 
 [project.optional-dependencies]

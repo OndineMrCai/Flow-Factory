@@ -1,13 +1,18 @@
 # Environment Configuration
 launcher: "accelerate"
-config_file: config/accelerate_configs/fsdp_grad_op_shard.yaml
-num_processes: 8  # 8x H20 96GB, plenty of VRAM for 1.3B training model + VideoScore2 (~7B) per rank
+config_file: multinode_examples/fsdp2_wan.yaml  # FSDP2 HYBRID_SHARD: shard within node, replicate across nodes
+# Multi-node: 4 nodes x 8 GPUs = 32 ranks. Each rank holds the 1.3B policy + VideoScore2 (~7B).
+num_machines: 4
+num_processes: 32
+main_process_ip: "10.0.0.1"      # ← REPLACE with your master node's internal IP
 main_process_port: 29500
+# machine_rank: must be DIFFERENT per node (0..3). Set via MACHINE_RANK / NODE_RANK env var,
+# which every cluster scheduler (K8s/Slurm/PAI/Volcano) injects automatically.
 mixed_precision: "bf16"
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/videoscore2"  # Replace with your T2V prompt dataset
+  dataset_dir: "dataset/videoscore2"  # Expects train.jsonl / test.jsonl with {"prompt", "negative_prompt"} per line
   preprocessing_batch_size: 8
   dataloader_num_workers: 8
   force_reprocess: true
@@ -23,6 +28,7 @@ model:
   model_type: "wan2_t2v"
   resume_path: null
   resume_type: null
+  attn_backend: '_flash_3_hub'
 
 log:
   run_name: null
@@ -47,12 +53,13 @@ train:
   kl_beta: 0  # Disabled for memory efficiency; enable (~1e-3) if training becomes unstable
   ref_param_device: 'cuda'
 
-  # Sampling settings
-  # Start with conservative settings matching the reference 14B config to confirm the model runs
-  resolution: 256
-  num_frames: 5
-  num_inference_steps: 10
-  guidance_scale: 5.0
+  # Sampling settings — fully aligned with VBench-2.0 / Wan2.1 native inference geometry.
+  # Train and eval now share the same length/resolution; only num_inference_steps stays
+  # lower to keep RL loop cheaper (training rarely needs full 50-step denoising).
+  resolution: [480, 832]              # [height, width]; Wan2.1-T2V-1.3B native
+  num_frames: 81                      # Matches eval & VBench canonical length
+  num_inference_steps: 50             # Keep low; sampling is the bottleneck at 81 frames
+  guidance_scale: 6.0                 # Wan2.1 official VBench setting
 
   # Batch and sampling
   per_device_batch_size: 1
@@ -87,14 +94,14 @@ scheduler:
   seed: 42
   flow_shift: 3.0  # 3.0 for 480p (5.0 for 720p)
 
-# Evaluation settings
+# Evaluation settings — exactly matches the VBench-2.0 sampling script's defaults for Wan2.1-T2V-1.3B
 eval:
-  resolution: 480
-  num_frames: 17
+  resolution: [480, 832]              # 832x480, Wan2.1 native VBench resolution
+  num_frames: 81                      # ~5.4s @ 15fps; canonical VBench length
   per_device_batch_size: 1
-  guidance_scale: 5.0
-  num_inference_steps: 28
-  eval_freq: 0  # disabled temporarily to isolate SIGFPE crash
+  guidance_scale: 6.0                 # Wan2.1 official VBench setting
+  num_inference_steps: 50             # Full denoising for evaluation quality
+  eval_freq: 0                        # Re-enable (e.g. 20) once SIGFPE is resolved
   seed: 42
 
 # Reward Model Configuration
@@ -113,8 +120,8 @@ rewards:
     visual_weight: 1.0        # Weight for visual quality dimension
     text_align_weight: 1.0    # Weight for text-to-video alignment dimension
     physical_weight: 1.0      # Weight for physical/common-sense consistency dimension
-    infer_fps: 2.0            # FPS used when feeding video frames to VideoScore2
-    store_fps: 8.0            # FPS used when writing the temp video file
+    infer_fps: 2.0            # FPS for Qwen2-VL frame sampling
+    store_fps: 15.0           # Wan2.1 native fps per VBench-2.0 sampling script. VLM sees num_frames*(infer/store) frames
 
 # Optional: use a separate (possibly cheaper) reward at eval time
 # eval_rewards:

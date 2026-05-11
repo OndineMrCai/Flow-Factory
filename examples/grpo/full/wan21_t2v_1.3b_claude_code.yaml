@@ -7,7 +7,7 @@ mixed_precision: "bf16"
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/videoscore2"  # Replace with your T2V prompt dataset
+  dataset_dir: "dataset/videoscore2"  # Expects train.jsonl / test.jsonl with {"prompt", "negative_prompt"} per line
   preprocessing_batch_size: 8
   dataloader_num_workers: 8
   force_reprocess: false
