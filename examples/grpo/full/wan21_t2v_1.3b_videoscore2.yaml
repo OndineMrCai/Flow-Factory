@@ -53,13 +53,12 @@ train:
   kl_beta: 0  # Disabled for memory efficiency; enable (~1e-3) if training becomes unstable
   ref_param_device: 'cuda'
 
-  # Sampling settings — fully aligned with VBench-2.0 / Wan2.1 native inference geometry.
-  # Train and eval now share the same length/resolution; only num_inference_steps stays
-  # lower to keep RL loop cheaper (training rarely needs full 50-step denoising).
+  # Sampling settings — Wan2.1 native aspect ratio kept; frames/steps trimmed for RL loop speed.
+  # Eval (below) still uses the full canonical 81-frame / 50-step setup.
   resolution: [480, 832]              # [height, width]; Wan2.1-T2V-1.3B native
-  num_frames: 81                      # Matches eval & VBench canonical length
-  num_inference_steps: 50             # Keep low; sampling is the bottleneck at 81 frames
-  guidance_scale: 6.0                 # Wan2.1 official VBench setting
+  num_frames: 33                      # 4*8+1; ~2s @ 16fps. VS2 sees 33*(2/15)≈4 frames
+  num_inference_steps: 8              # Flow-GRPO range (8-10); lower hurts sample quality / reward
+  guidance_scale: 5.0                 # Slightly below eval's 6.0 to leave room for exploration
 
   # Batch and sampling
   per_device_batch_size: 1
